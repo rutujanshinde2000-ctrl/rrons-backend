@@ -1,186 +1,160 @@
-// server.js
-// Run with Node (in Docker we use Playwright image)
-// Packages: express, axios, cheerio, robots-parser, playwright
-
-const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const RobotsParser = require('robots-parser');
-const { chromium } = require('playwright');
+const express = require("express");
+const axios = require("axios");
+const cheerio = require("cheerio");
+const RobotsParser = require("robots-parser");
+const { chromium } = require("playwright");
 
 const app = express();
 app.use(express.json());
 
-// Helper: normalize URL
+// Normalize URL
 function normalizeUrl(u) {
   try {
     return new URL(u).toString();
-  } catch (e) {
-    // try adding https
+  } catch {
     try {
-      return new URL('https://' + u).toString();
-    } catch (e2) {
+      return new URL("https://" + u).toString();
+    } catch {
       return null;
     }
   }
 }
 
-// Fetch robots.txt and check permission for User-agent: *
-async function isAllowedByRobots(targetUrl) {
+// Check robots.txt
+async function checkRobots(url) {
   try {
-    const urlObj = new URL(targetUrl);
-    const robotsUrl = `${urlObj.origin}/robots.txt`;
-    const rres = await axios.get(robotsUrl, { timeout: 5000 }).catch(() => null);
-    if (!rres || !rres.data) {
-      // no robots.txt => assume allowed
-      return { allowed: true, reason: 'no-robots' };
-    }
-    const robotsTxt = rres.data;
-    const robots = RobotsParser(robotsUrl, robotsTxt);
-    const allowed = robots.isAllowed(targetUrl, '*');
-    return { allowed, reason: allowed ? 'robots-allowed' : 'disallowed-by-robots' };
-  } catch (err) {
-    return { allowed: true, reason: 'robots-check-failed' }; // fallback allow
+    const base = new URL(url).origin;
+    const robotsUrl = base + "/robots.txt";
+    const res = await axios.get(robotsUrl).catch(() => null);
+
+    if (!res) return { allowed: true };
+
+    const robots = RobotsParser(robotsUrl, res.data);
+    const allowed = robots.isAllowed(url, "*");
+
+    return { allowed };
+  } catch {
+    return { allowed: true };
   }
 }
 
-// Detect simple Cloudflare/bot-block responses by headers/body
-function detectBlocking(body, headers) {
-  const headerServer = (headers && (headers.server || headers['cf-ray'] || headers['cf-chl-bypass'])) || '';
-  const bodyStr = (body || '').toString().toLowerCase();
+// Detect Cloudflare / bot protection
+function blocked(body, headers) {
+  const text = (body || "").toString().toLowerCase();
 
-  if (/cloudflare/.test(headerServer) || /cloudflare/i.test(bodyStr) ||
-      /attention required|verify you are human|challenge-form|cf-chl-bypass/i.test(bodyStr)) {
-    return 'cloudflare';
+  if (/cloudflare|captcha|access denied|verify you are human/.test(text)) {
+    return true;
   }
-  if (/captcha/i.test(bodyStr)) return 'captcha';
-  if (/access denied/i.test(bodyStr)) return 'access-denied';
-  return null;
+  return false;
 }
 
-// Try lightweight fetch with axios
-async function fetchWithAxios(url) {
+// Try scraping with Axios
+async function scrapeAxios(url) {
   try {
     const res = await axios.get(url, {
       timeout: 15000,
-      headers: {
-        'User-Agent': 'RRONS-Scraper/1.0 (+https://rrons.in)'
-      },
-      // allow large bodies
-      maxBodyLength: 5 * 1024 * 1024
+      headers: { "User-Agent": "RRONS-SCRAPER/1.0" }
     });
-    return { ok: true, status: res.status, headers: res.headers, data: res.data };
-  } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+
+    if (blocked(res.data, res.headers)) {
+      return { ok: false, reason: "blocked" };
+    }
+
+    return { ok: true, html: res.data };
+  } catch (e) {
+    return { ok: false, reason: "fetch_failed" };
   }
 }
 
-// Use Playwright to render JavaScript pages (only when allowed and requested)
-async function fetchWithPlaywright(url) {
-  const browser = await chromium.launch({ args: ['--no-sandbox'] });
-  const page = await browser.newPage({ userAgent: 'RRONS-Scraper-Playwright/1.0' });
+// Scrape JS websites using Playwright
+async function scrapePlaywright(url) {
+  const browser = await chromium.launch({ args: ["--no-sandbox"] });
+  const page = await browser.newPage();
   try {
-    await page.goto(url, { timeout: 30000, waitUntil: 'networkidle' });
-    const html = await page.content();
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    const content = await page.content();
     await browser.close();
-    return { ok: true, data: html };
-  } catch (err) {
+    return { ok: true, html: content };
+  } catch (e) {
     await browser.close();
-    return { ok: false, error: err.message || String(err) };
+    return { ok: false, reason: "playwright_failed" };
   }
 }
 
-// Extract content with cheerio
-function extractFromHtml(html, targetUrl) {
+// Extract content using Cheerio
+function extract(html, url) {
   const $ = cheerio.load(html);
-  const title = $('title').text().trim();
-  const headings = [];
-  $('h1,h2,h3,h4').each((i, el) => { headings.push($(el).text().trim()); });
 
-  // gather links, making them absolute
+  const title = $("title").text().trim();
+
+  const headings = [];
+  $("h1,h2,h3").each((i, el) => headings.push($(el).text().trim()));
+
   const links = [];
-  $('a[href]').each((i, el) => {
-    let href = $(el).attr('href');
+  $("a[href]").each((i, el) => {
     try {
-      href = new URL(href, targetUrl).toString();
-    } catch (e) { /* ignore */ }
-    links.push(href);
+      links.push(new URL($(el).attr("href"), url).toString());
+    } catch {}
   });
 
-  // main text: collect paragraphs
   const paragraphs = [];
-  $('p').each((i, el) => {
+  $("p").each((i, el) => {
     const t = $(el).text().trim();
     if (t) paragraphs.push(t);
   });
 
-  const text = paragraphs.join('\n\n');
-  return { title, headings, links, text };
+  return {
+    title,
+    headings,
+    links,
+    text: paragraphs.join("\n\n")
+  };
 }
 
-// Main endpoint
-app.post('/scrape', async (req, res) => {
-  const { url, usePlaywright } = req.body || {};
-  if (!url) return res.status(400).json({ success: false, error: 'url is required' });
+// API Endpoint
+app.post("/scrape", async (req, res) => {
+  const { url } = req.body;
 
-  const normalized = normalizeUrl(url);
-  if (!normalized) return res.status(400).json({ success: false, error: 'invalid url' });
+  const finalUrl = normalizeUrl(url);
+  if (!finalUrl) return res.json({ success: false, message: "Invalid URL" });
 
-  // 1) Robots check
-  const robots = await isAllowedByRobots(normalized);
+  // 1. Check robots.txt (legal)
+  const robots = await checkRobots(finalUrl);
   if (!robots.allowed) {
-    return res.status(403).json({
+    return res.json({
       success: false,
-      reason: 'blocked_by_robots',
-      message: 'This site disallows scraping via robots.txt'
+      reason: "robots_block",
+      message: "This website does not legally allow scraping."
     });
   }
 
-  // 2) Try lightweight fetch
-  const ax = await fetchWithAxios(normalized);
-  if (!ax.ok) {
-    // network error — we may show a clear message
-    return res.status(502).json({ success: false, reason: 'fetch_failed', message: ax.error || 'fetch failed' });
+  // 2. Try normal scraping
+  let result = await scrapeAxios(finalUrl);
+
+  // If blocked or empty content, try Playwright
+  if (!result.ok || (result.ok && result.html.length < 1000)) {
+    result = await scrapePlaywright(finalUrl);
   }
 
-  // 3) Detect blocking
-  const block = detectBlocking(ax.data, ax.headers);
-  if (block) {
-    return res.status(403).json({
+  if (!result.ok) {
+    return res.json({
       success: false,
-      reason: 'blocked_by_bot_protection',
-      message: `This site appears to be protected (${block}). Scraping blocked.`,
+      reason: result.reason,
+      message: "Website cannot be scraped due to protection or errors."
     });
   }
 
-  // 4) Parse with cheerio
-  const parsed = extractFromHtml(ax.data, normalized);
+  // 3. Extract
+  const data = extract(result.html, finalUrl);
 
-  // If text is very small AND user allows JS rendering, try Playwright
-  const textLength = (parsed.text || '').trim().length;
-  if (textLength < 100 && (usePlaywright === true || usePlaywright === 'auto')) {
-    // Double-check robots.txt allowed for user-agent (we already checked), proceed
-    const pw = await fetchWithPlaywright(normalized);
-    if (!pw.ok) {
-      return res.status(502).json({ success: false, reason: 'playwright_failed', message: pw.error });
-    }
-    const parsed2 = extractFromHtml(pw.data, normalized);
-    // detect if still blocked
-    const block2 = detectBlocking(pw.data, {});
-    if (block2) {
-      return res.status(403).json({
-        success: false,
-        reason: 'blocked_after_playwright',
-        message: `Site blocks automated browsers (${block2}).`
-      });
-    }
-    // respond with richer parse
-    return res.json({ success: true, engine: 'playwright', data: parsed2 });
-  }
-
-  // otherwise return the axios parse
-  return res.json({ success: true, engine: 'axios', data: parsed });
+  res.json({
+    success: true,
+    engine: "scraper",
+    data
+  });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log('Scraper API running on port', PORT));
+app.listen(PORT, () => console.log("Backend running on port", PORT));
+
+
