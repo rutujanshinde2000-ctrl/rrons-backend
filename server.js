@@ -20,11 +20,11 @@ function normalizeUrl(u) {
   }
 }
 
-// Check robots.txt
+// Check robots.txt legality
 async function checkRobots(url) {
   try {
-    const base = new URL(url).origin;
-    const robotsUrl = base + "/robots.txt";
+    const origin = new URL(url).origin;
+    const robotsUrl = origin + "/robots.txt";
     const res = await axios.get(robotsUrl).catch(() => null);
 
     if (!res) return { allowed: true };
@@ -38,22 +38,26 @@ async function checkRobots(url) {
   }
 }
 
-// Detect Cloudflare / bot protection
+// Detect blocked / protected sites
 function blocked(body, headers) {
   const text = (body || "").toString().toLowerCase();
 
-  if (/cloudflare|captcha|access denied|verify you are human/.test(text)) {
+  if (
+    /cloudflare|captcha|access denied|verify you are human|challenge-form/.test(
+      text
+    )
+  ) {
     return true;
   }
   return false;
 }
 
-// Try scraping with Axios
+// Try normal axios scraping
 async function scrapeAxios(url) {
   try {
     const res = await axios.get(url, {
       timeout: 15000,
-      headers: { "User-Agent": "RRONS-SCRAPER/1.0" }
+      headers: { "User-Agent": "RRONS-SCRAPER/1.0" },
     });
 
     if (blocked(res.data, res.headers)) {
@@ -66,10 +70,11 @@ async function scrapeAxios(url) {
   }
 }
 
-// Scrape JS websites using Playwright
+// Try dynamic JS scraping using Playwright
 async function scrapePlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
+
   try {
     await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
     const content = await page.content();
@@ -81,12 +86,11 @@ async function scrapePlaywright(url) {
   }
 }
 
-// Extract content using Cheerio
+// Extract content with Cheerio
 function extract(html, url) {
   const $ = cheerio.load(html);
 
   const title = $("title").text().trim();
-
   const headings = [];
   $("h1,h2,h3").each((i, el) => headings.push($(el).text().trim()));
 
@@ -107,32 +111,32 @@ function extract(html, url) {
     title,
     headings,
     links,
-    text: paragraphs.join("\n\n")
+    text: paragraphs.join("\n\n"),
   };
 }
 
-// API Endpoint
+// Main scraping endpoint
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
 
   const finalUrl = normalizeUrl(url);
   if (!finalUrl) return res.json({ success: false, message: "Invalid URL" });
 
-  // 1. Check robots.txt (legal)
+  // 1. robots.txt check (legal)
   const robots = await checkRobots(finalUrl);
   if (!robots.allowed) {
     return res.json({
       success: false,
       reason: "robots_block",
-      message: "This website does not legally allow scraping."
+      message: "This website does not legally allow scraping.",
     });
   }
 
-  // 2. Try normal scraping
+  // 2. Try axios
   let result = await scrapeAxios(finalUrl);
 
-  // If blocked or empty content, try Playwright
-  if (!result.ok || (result.ok && result.html.length < 1000)) {
+  // 3. If blocked or small HTML, try Playwright
+  if (!result.ok || (result.ok && result.html.length < 500)) {
     result = await scrapePlaywright(finalUrl);
   }
 
@@ -140,21 +144,24 @@ app.post("/scrape", async (req, res) => {
     return res.json({
       success: false,
       reason: result.reason,
-      message: "Website cannot be scraped due to protection or errors."
+      message: "Website cannot be scraped due to protection.",
     });
   }
 
-  // 3. Extract
+  // 4. Extract data
   const data = extract(result.html, finalUrl);
 
   res.json({
     success: true,
     engine: "scraper",
-    data
+    data,
   });
 });
 
+// Start server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log("Backend running on port", PORT));
+app.listen(PORT, () => console.log("Scraper running on port", PORT));
 
+    
 
+  
