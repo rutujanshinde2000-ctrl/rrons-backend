@@ -1,3 +1,4 @@
+const cors = require("cors");
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
@@ -5,6 +6,7 @@ const RobotsParser = require("robots-parser");
 const { chromium } = require("playwright");
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 // Normalize URL
