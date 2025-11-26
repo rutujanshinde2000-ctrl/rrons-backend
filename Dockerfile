@@ -7,14 +7,14 @@ WORKDIR /usr/src/app
 # Copy package.json first for caching
 COPY package.json package-lock.json* ./ 
 
-# Install deps (playwright image already has node & browsers)
+# Install dependencies
 RUN npm install --production
 
-# Copy rest
+# Copy the rest of the backend code
 COPY . .
 
-# Expose port
+# Expose port 5000
 EXPOSE 5000
 
-# Start server
+# Start the server
 CMD ["node", "server.js"]
