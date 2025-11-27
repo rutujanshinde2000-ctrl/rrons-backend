@@ -1,20 +1,20 @@
-# Use Playwright official image with browsers preinstalled
+# Use Playwright official image
 FROM mcr.microsoft.com/playwright:focal
 
 # Create app directory
-WORKDIR /usr/src/app
+WORKDIR /app
 
-# Copy package.json first for caching
-COPY package.json package-lock.json* ./ 
+# Copy package files
+COPY package.json package-lock.json* ./
 
 # Install dependencies
 RUN npm install --production
 
-# Copy the rest of the backend code
+# Copy ALL project files
 COPY . .
 
-# Expose port 5000
+# Expose port
 EXPOSE 5000
 
-# Start the server
+# Start server
 CMD ["node", "server.js"]
