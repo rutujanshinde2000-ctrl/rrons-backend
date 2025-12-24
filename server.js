@@ -4,10 +4,19 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const RobotsParser = require("robots-parser");
 const { chromium } = require("playwright");
+const jwt = require("jsonwebtoken");
+
+const { verifyGoogleToken, createJWT } = require("./auth");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || "rrons_secret_key";
+
+/* =========================
+   HELPER FUNCTIONS
+========================= */
 
 // Normalize URL
 function normalizeUrl(u) {
@@ -22,148 +31,142 @@ function normalizeUrl(u) {
   }
 }
 
-// Check robots.txt legality
+// robots.txt check
 async function checkRobots(url) {
   try {
     const origin = new URL(url).origin;
     const robotsUrl = origin + "/robots.txt";
     const res = await axios.get(robotsUrl).catch(() => null);
-
     if (!res) return { allowed: true };
 
     const robots = RobotsParser(robotsUrl, res.data);
-    const allowed = robots.isAllowed(url, "*");
-
-    return { allowed };
+    return { allowed: robots.isAllowed(url, "*") };
   } catch {
     return { allowed: true };
   }
 }
 
-// Detect blocked / protected sites
-function blocked(body, headers) {
-  const text = (body || "").toString().toLowerCase();
-
-  if (
-    /cloudflare|captcha|access denied|verify you are human|challenge-form/.test(
-      text
-    )
-  ) {
-    return true;
-  }
-  return false;
+// detect bot protection
+function blocked(body) {
+  const text = (body || "").toLowerCase();
+  return /cloudflare|captcha|verify you are human|access denied/.test(text);
 }
 
-// Try normal axios scraping
+// axios scrape
 async function scrapeAxios(url) {
   try {
     const res = await axios.get(url, {
       timeout: 15000,
-      headers: { "User-Agent": "RRONS-SCRAPER/1.0" },
+      headers: { "User-Agent": "RRONS-SCRAPER/1.0" }
     });
-
-    if (blocked(res.data, res.headers)) {
-      return { ok: false, reason: "blocked" };
-    }
-
+    if (blocked(res.data)) return { ok: false, reason: "blocked" };
     return { ok: true, html: res.data };
-  } catch (e) {
+  } catch {
     return { ok: false, reason: "fetch_failed" };
   }
 }
 
-// Try dynamic JS scraping using Playwright
+// playwright scrape
 async function scrapePlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
-
   try {
     await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
     const content = await page.content();
     await browser.close();
     return { ok: true, html: content };
-  } catch (e) {
+  } catch {
     await browser.close();
     return { ok: false, reason: "playwright_failed" };
   }
 }
 
-// Extract content with Cheerio
-function extract(html, url) {
+// extract content
+function extract(html, url, fields = [], selector = null) {
   const $ = cheerio.load(html);
+  const scope = selector ? $(selector) : $.root();
 
-  const title = $("title").text().trim();
-  const headings = [];
-  $("h1,h2,h3").each((i, el) => headings.push($(el).text().trim()));
+  const data = {};
 
-  const links = [];
-  $("a[href]").each((i, el) => {
-    try {
-      links.push(new URL($(el).attr("href"), url).toString());
-    } catch {}
-  });
+  if (fields.includes("title")) {
+    data.title = $("title").text().trim();
+  }
 
-  const paragraphs = [];
-  $("p").each((i, el) => {
-    const t = $(el).text().trim();
-    if (t) paragraphs.push(t);
-  });
+  if (fields.includes("headings")) {
+    data.headings = [];
+    scope.find("h1,h2,h3").each((_, el) => {
+      const t = $(el).text().trim();
+      if (t) data.headings.push(t);
+    });
+  }
 
-  return {
-    title,
-    headings,
-    links,
-    text: paragraphs.join("\n\n"),
-  };
+  if (fields.includes("links")) {
+    data.links = [];
+    scope.find("a[href]").each((_, el) => {
+      try {
+        data.links.push(new URL($(el).attr("href"), url).toString());
+      } catch {}
+    });
+  }
+
+  if (fields.includes("text")) {
+    const paragraphs = [];
+    scope.find("p").each((_, el) => {
+      const t = $(el).text().trim();
+      if (t) paragraphs.push(t);
+    });
+    data.text = paragraphs.join("\n\n");
+  }
+
+  return data;
 }
 
-// Main scraping endpoint
-app.post("/scrape", async (req, res) => {
-  const { url } = req.body;
+/* =========================
+   AUTH ROUTE
+========================= */
 
-  const finalUrl = normalizeUrl(url);
-  if (!finalUrl) return res.json({ success: false, message: "Invalid URL" });
+app.post("/auth/google", async (req, res) => {
+  const { token } = req.body;
 
-  // 1. robots.txt check (legal)
-  const robots = await checkRobots(finalUrl);
-  if (!robots.allowed) {
-    return res.json({
+  try {
+    const payload = await verifyGoogleToken(token);
+
+    const user = {
+      email: payload.email,
+      name: payload.name,
+      picture: payload.picture
+    };
+
+    const jwtToken = createJWT(user);
+
+    res.json({
+      success: true,
+      token: jwtToken,
+      user
+    });
+  } catch {
+    res.status(401).json({
       success: false,
-      reason: "robots_block",
-      message: "This website does not legally allow scraping.",
+      message: "Google authentication failed"
     });
   }
-
-  // 2. Try axios
-  let result = await scrapeAxios(finalUrl);
-
-  // 3. If blocked or small HTML, try Playwright
-  if (!result.ok || (result.ok && result.html.length < 500)) {
-    result = await scrapePlaywright(finalUrl);
-  }
-
-  if (!result.ok) {
-    return res.json({
-      success: false,
-      reason: result.reason,
-      message: "Website cannot be scraped due to protection.",
-    });
-  }
-
-  // 4. Extract data
-  const data = extract(result.html, finalUrl);
-
-  res.json({
-    success: true,
-    engine: "scraper",
-    data,
-  });
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log("Scraper running on port", PORT));
+/* =========================
+   OPTIONAL AUTH MIDDLEWARE
+========================= */
 
-    
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ success: false });
 
-  
+  try {
+    const token = auth.split(" ")[1];
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ success: false });
+  }
+}
+
+/* ================*
