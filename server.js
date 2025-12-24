@@ -1,3 +1,4 @@
+const { verifyGoogleToken, createJWT } = require("./auth");
 const cors = require("cors");
 const express = require("express");
 const axios = require("axios");
@@ -6,6 +7,40 @@ const RobotsParser = require("robots-parser");
 const { chromium } = require("playwright");
 const jwt = require("jsonwebtoken");
 
+app.post("/auth/google", async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: "Google token missing"
+      });
+    }
+
+    const user = await verifyGoogleToken(token);
+    const jwtToken = createJWT({
+      email: user.email,
+      name: user.name,
+      picture: user.picture
+    });
+
+    res.json({
+      success: true,
+      token: jwtToken,
+      user: {
+        email: user.email,
+        name: user.name,
+        picture: user.picture
+      }
+    });
+  } catch (err) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid Google token"
+    });
+  }
+});
 const { verifyGoogleToken, createJWT } = require("./auth");
 
 const app = express();
